@@ -22,7 +22,9 @@ import {
 import {
   hasSupabaseConfig,
   createSignedPresentationUrl,
+  getStudentResponse,
   joinClassSession,
+  subscribeToPresentation,
   subscribeToSession,
   submitResponse,
   supabase,
@@ -33,6 +35,7 @@ import {
   type SessionBundle,
   type SlideType,
 } from "@plexia/shared";
+import SharedResultsView from "./components/SharedResultsView";
 
 const MAX_ANSWER_LENGTH = 2000;
 const MAX_NICKNAME_LENGTH = 24;
@@ -79,14 +82,30 @@ function contentText(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function stripStudentPrivateFields(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripStudentPrivateFields);
+  if (!value || typeof value !== "object") return value;
+  const privateFields = new Set(["correctIndex", "correct_index", "answerKey", "answer_key", "explanation"]);
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => !privateFields.has(key))
+    .map(([key, child]) => [key, stripStudentPrivateFields(child)]));
+}
+
+function sanitizeStudentPresentation(presentation: Presentation): Presentation {
+  const clean = stripStudentPrivateFields(presentation) as Record<string, unknown>;
+  delete clean.ownerId;
+  return clean as unknown as Presentation;
+}
+
 function displayStatus(session: ClassSession): { label: string; tone: "live" | "paused" | "ended" } {
   if (session.status === "ended" || session.activityStatus === "ended") return { label: "Stunde beendet", tone: "ended" };
   if (session.status === "paused" || session.activityStatus === "paused") return { label: "Stunde pausiert", tone: "paused" };
+  if (session.activityStatus !== "running") return { label: "Warte auf Start", tone: "paused" };
   return { label: "Stunde läuft", tone: "live" };
 }
 
 function sessionIsUnavailable(session: ClassSession): boolean {
-  return session.status !== "live" || session.activityStatus === "paused" || session.activityStatus === "ended";
+  return session.status !== "live" || session.activityStatus !== "running";
 }
 
 function App() {
@@ -105,6 +124,7 @@ function App() {
     if (!bundle || !supabase) return;
     let active = true;
     let channel: ReturnType<typeof subscribeToSession> | null = null;
+    let presentationChannel: ReturnType<typeof subscribeToPresentation> | null = null;
     try {
       channel = subscribeToSession(
         bundle.session.id,
@@ -116,14 +136,19 @@ function App() {
         },
         () => undefined,
       );
+      presentationChannel = subscribeToPresentation(bundle.session.presentationId, (presentation) => {
+        if (!active) return;
+        setBundle((current) => current ? { ...current, presentation: sanitizeStudentPresentation(presentation) } : current);
+      });
     } catch (error) {
       setSessionError(`Live-Aktualisierung nicht verfügbar: ${errorMessage(error)}`);
     }
     return () => {
       active = false;
       if (channel && supabase) void supabase.removeChannel(channel);
+      if (presentationChannel && supabase) void supabase.removeChannel(presentationChannel);
     };
-  }, [bundle?.session.id]);
+  }, [bundle?.session.id, bundle?.session.presentationId]);
 
   const handleJoin = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -331,7 +356,7 @@ function SessionView({
       </section>
       {sessionError && <div className="inline-error" role="alert">{sessionError}</div>}
       {unavailable ? (
-        <PausedNotice status={status} onLeave={onLeave} />
+        <PausedNotice status={status} activityStatus={session.activityStatus} onLeave={onLeave} />
       ) : slide ? (
         <SlideView
           key={`${session.id}-${slide.id}`}
@@ -350,14 +375,15 @@ function SessionView({
   );
 }
 
-function PausedNotice({ status, onLeave }: { status: { label: string; tone: string }; onLeave: () => void }) {
+function PausedNotice({ status, activityStatus, onLeave }: { status: { label: string; tone: string }; activityStatus: ClassSession["activityStatus"]; onLeave: () => void }) {
   const ended = status.tone === "ended";
+  const waitingToStart = activityStatus === "idle";
   return (
     <section className={`pause-card ${ended ? "ended" : "paused"}`}>
       <div className="pause-icon">{ended ? <CheckCircle2 size={27} aria-hidden="true" /> : <Radio size={27} aria-hidden="true" />}</div>
-      <span className="eyebrow">{ended ? "BIS ZUM NÄCHSTEN MAL" : "KURZE PAUSE"}</span>
-      <h2>{ended ? "Die Stunde ist beendet." : "Die Stunde macht gerade Pause."}</h2>
-      <p>{ended ? "Deine Lehrkraft hat die Stunde beendet. Du kannst diese Ansicht jetzt schließen." : "Sobald deine Lehrkraft weitermacht, aktualisiert sich diese Seite automatisch."}</p>
+      <span className="eyebrow">{ended ? "BIS ZUM NÄCHSTEN MAL" : waitingToStart ? "GLEICH GEHT ES LOS" : "KURZE PAUSE"}</span>
+      <h2>{ended ? "Die Stunde ist beendet." : waitingToStart ? "Die Stunde hat noch nicht begonnen." : "Die Stunde macht gerade Pause."}</h2>
+      <p>{ended ? "Deine Lehrkraft hat die Stunde beendet. Du kannst diese Ansicht jetzt schließen." : waitingToStart ? "Sobald deine Lehrkraft die Aktivität startet, erscheint die Aufgabe hier automatisch." : "Sobald deine Lehrkraft weitermacht, erscheint die Aufgabe hier automatisch."}</p>
       {ended && <button type="button" className="button button-secondary" onClick={onLeave}>Zur Startseite <ArrowRight size={17} aria-hidden="true" /></button>}
     </section>
   );
@@ -384,6 +410,8 @@ function SlideView({
   const [ideaDraft, setIdeaDraft] = useState("");
   const [photo, setPhoto] = useState<File | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [responseLoading, setResponseLoading] = useState(false);
+  const [hasExistingResponse, setHasExistingResponse] = useState(false);
   const [photoError, setPhotoError] = useState("");
   const supportsIdeas = slide.type === "mindmap" || slide.type === "brainstorm" || slide.type === "wordcloud";
   const isChoice = slide.type === "multiple_choice" || slide.type === "poll";
@@ -392,8 +420,30 @@ function SlideView({
   const unavailable = sessionIsUnavailable(session);
 
   useEffect(() => {
+    let active = true;
     setAnswer(""); setSelected([]); setIdeas([]); setIdeaDraft(""); setPhoto(null); setPhotoError("");
-  }, [slide.id]);
+    setHasExistingResponse(false);
+    if (!canRespond) return () => { active = false; };
+    setResponseLoading(true);
+    void getStudentResponse(session.id, slide.id).then((response) => {
+      if (!active || !response) return;
+      setHasExistingResponse(true);
+      if (supportsIdeas) {
+        const savedIdeas = response.answerJson.ideas;
+        setIdeas(Array.isArray(savedIdeas) ? savedIdeas.filter((idea): idea is string => typeof idea === "string") : response.answerText.split("\n").filter(Boolean));
+      } else if (isChoice) {
+        const savedChoices = response.answerJson.choices;
+        setSelected(Array.isArray(savedChoices) ? savedChoices.filter((choice): choice is string => typeof choice === "string") : response.answerText.split(", ").filter(Boolean));
+      } else {
+        setAnswer(response.answerText);
+      }
+    }).catch((error) => {
+      if (active) onError(errorMessage(error));
+    }).finally(() => {
+      if (active) setResponseLoading(false);
+    });
+    return () => { active = false; };
+  }, [session.id, slide.id, canRespond, isChoice, supportsIdeas, onError]);
 
   const addIdea = () => {
     const next = ideaDraft.trim().slice(0, 180);
@@ -433,8 +483,9 @@ function SlideView({
         answerJson: supportsIdeas ? { ideas } : isChoice ? { choices: selected } : {},
         ...(mediaPath ? { mediaPath } : {}),
       });
-      onNotice("Deine Antwort ist angekommen. Danke fürs Mitmachen!");
-      setAnswer(""); setSelected([]); setIdeas([]); setIdeaDraft(""); setPhoto(null);
+      setHasExistingResponse(true);
+      onNotice("Deine Antwort ist angekommen. Du kannst sie auf dieser Folie noch korrigieren.");
+      setPhoto(null);
       const input = document.getElementById(`photo-${slide.id}`) as HTMLInputElement | null;
       if (input) input.value = "";
     } catch (error) {
@@ -480,11 +531,13 @@ function SlideView({
         photoError={photoError}
         setPhotoError={setPhotoError}
         submitting={submitting}
+        responseLoading={responseLoading}
+        hasExistingResponse={hasExistingResponse}
         unavailable={unavailable}
         sentNotice={sentNotice}
         onSubmit={submit}
       />
-      {slide.type === "results" && <p className="results-note">Die Lehrkraft zeigt hier, was die Klasse gemeinsam gesammelt hat.</p>}
+      {slide.type === "results" && <SharedResultsView value={slide.content.sharedResults} />}
       <SlideNavigation />
     </section>
   );
@@ -595,14 +648,16 @@ function InteractionContent(props: {
   photoError: string;
   setPhotoError: (message: string) => void;
   submitting: boolean;
+  responseLoading: boolean;
+  hasExistingResponse: boolean;
   unavailable: boolean;
   sentNotice: string;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const { slide, options, multiple, isChoice, isOpenResponse, supportsIdeas, canRespond, answer, setAnswer, selected, toggleOption, ideas, ideaDraft, setIdeaDraft, addIdea, removeIdea, photo, setPhoto, photoError, setPhotoError, submitting, unavailable, sentNotice, onSubmit } = props;
+  const { slide, options, multiple, isChoice, isOpenResponse, supportsIdeas, canRespond, answer, setAnswer, selected, toggleOption, ideas, ideaDraft, setIdeaDraft, addIdea, removeIdea, photo, setPhoto, photoError, setPhotoError, submitting, responseLoading, hasExistingResponse, unavailable, sentNotice, onSubmit } = props;
   if (!canRespond) {
+    if (slide.type === "results") return null;
     if (slide.type === "video") return <div className="slide-guidance"><Video size={18} aria-hidden="true" /> Schau dir das Video gemeinsam mit deiner Klasse an.</div>;
-    if (slide.type === "results") return <div className="slide-guidance"><CheckCircle2 size={18} aria-hidden="true" /> Die Ergebnisse werden von deiner Lehrkraft geteilt.</div>;
     return <div className="slide-guidance">Lies die Folie in Ruhe durch und folge den Hinweisen deiner Lehrkraft.</div>;
   }
   return (
@@ -640,14 +695,15 @@ function InteractionContent(props: {
       {(slide.type === "photo_task" || slide.type === "worksheet" || slide.type === "free_text" || slide.type === "group_work") && (
         <div className="photo-upload">
           <label className="field-label" htmlFor={`photo-${slide.id}`}>Foto hinzufügen <span className="optional-label">optional</span></label>
-          <div className="upload-control"><input id={`photo-${slide.id}`} type="file" accept="image/*" capture="environment" disabled={unavailable || submitting} onChange={(event: ChangeEvent<HTMLInputElement>) => { const file = event.target.files?.[0] ?? null; setPhotoError(""); if (file && file.size > 12 * 1024 * 1024) { setPhoto(null); setPhotoError("Das Foto darf höchstens 12 MB groß sein."); event.target.value = ""; return; } setPhoto(file); }} /><span className="upload-button"><ImagePlus size={17} aria-hidden="true" /> Foto auswählen</span><span className="upload-name">{photo?.name ?? "JPG, PNG oder HEIC · max. 12 MB"}</span></div>
+          <div className="upload-control"><input id={`photo-${slide.id}`} type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" capture="environment" disabled={unavailable || submitting} onChange={(event: ChangeEvent<HTMLInputElement>) => { const file = event.target.files?.[0] ?? null; setPhotoError(""); if (file && !["image/png", "image/jpeg", "image/webp"].includes(file.type)) { setPhoto(null); setPhotoError("Dieses Bildformat wird nicht unterstützt. Bitte wähle PNG, JPEG oder WebP; HEIC kann hier nicht hochgeladen werden."); event.target.value = ""; return; } if (file && file.size > 12 * 1024 * 1024) { setPhoto(null); setPhotoError("Das Foto darf höchstens 12 MB groß sein."); event.target.value = ""; return; } setPhoto(file); }} /><span className="upload-button"><ImagePlus size={17} aria-hidden="true" /> Foto auswählen</span><span className="upload-name">{photo?.name ?? "PNG, JPEG oder WebP · max. 12 MB"}</span></div>
           {photoError && <p className="form-error" role="alert">{photoError}</p>}
         </div>
       )}
       {sentNotice && <div className="success-notice" role="status"><CheckCircle2 size={19} aria-hidden="true" /><span>{sentNotice}</span></div>}
       {unavailable && <p className="field-help">Du kannst gerade nichts absenden, weil die Stunde pausiert oder beendet ist.</p>}
-      <button className="button button-primary submit-button" type="submit" disabled={unavailable || submitting || (isChoice && selected.length === 0 && !photo) || (supportsIdeas && ideas.length === 0 && !photo) || (isOpenResponse && !answer.trim() && !photo)}>
-        {submitting ? <><LoaderCircle size={18} className="spin" aria-hidden="true" /> Wird gesendet …</> : <>Antwort senden <Send size={17} aria-hidden="true" /></>}
+      {responseLoading && <p className="field-help" role="status">Deine gespeicherte Antwort wird geladen …</p>}
+      <button className="button button-primary submit-button" type="submit" disabled={unavailable || submitting || responseLoading || (isChoice && selected.length === 0 && !photo) || (supportsIdeas && ideas.length === 0 && !photo) || (isOpenResponse && !answer.trim() && !photo)}>
+        {submitting ? <><LoaderCircle size={18} className="spin" aria-hidden="true" /> Wird gesendet …</> : <>{hasExistingResponse ? "Antwort korrigieren" : "Antwort senden"} <Send size={17} aria-hidden="true" /></>}
       </button>
       <p className="response-privacy"><LockKeyhole size={13} aria-hidden="true" /> Deine Antwort wird mit deinem Nickname an die Lehrkraft übermittelt.</p>
     </form>
