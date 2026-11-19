@@ -678,6 +678,22 @@ function SlideView({
       : current.includes(option) ? [] : [option]);
   };
 
+  const recheckReview = async () => {
+    setResponseLoading(true);
+    try {
+      const response = await getStudentResponse(session.id, slide.id);
+      if (!response) throw new Error("Deine Antwort konnte nicht gefunden werden.");
+      if (mounted.current) {
+        setReviewed(Boolean(response.reviewed));
+        if (!response.reviewed) onNotice("Deine Lehrkraft hat die Antwort zur Korrektur freigegeben.");
+      }
+    } catch (error) {
+      if (mounted.current) onError(errorMessage(error));
+    } finally {
+      if (mounted.current) setResponseLoading(false);
+    }
+  };
+
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!canRespond || unavailable || submitting) return;
@@ -768,6 +784,7 @@ function SlideView({
         responseLoading={responseLoading}
         hasExistingResponse={hasExistingResponse}
         reviewed={reviewed}
+        onRecheckReview={() => void recheckReview()}
         unavailable={unavailable}
         sentNotice={sentNotice}
         groupNumber={groupNumber}
@@ -897,13 +914,14 @@ function InteractionContent(props: {
   responseLoading: boolean;
   hasExistingResponse: boolean;
   reviewed: boolean;
+  onRecheckReview: () => void;
   unavailable: boolean;
   sentNotice: string;
   groupNumber: number | null;
   groupError: string;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const { slide, options, multiple, isChoice, isOpenResponse, supportsIdeas, canRespond, answer, setAnswer, selected, toggleOption, ideas, ideaDraft, setIdeaDraft, addIdea, removeIdea, photo, setPhoto, photoError, setPhotoError, submitting, responseLoading, hasExistingResponse, reviewed, unavailable, sentNotice, groupNumber, groupError, onSubmit } = props;
+  const { slide, options, multiple, isChoice, isOpenResponse, supportsIdeas, canRespond, answer, setAnswer, selected, toggleOption, ideas, ideaDraft, setIdeaDraft, addIdea, removeIdea, photo, setPhoto, photoError, setPhotoError, submitting, responseLoading, hasExistingResponse, reviewed, onRecheckReview, unavailable, sentNotice, groupNumber, groupError, onSubmit } = props;
   if (!canRespond) {
     if (slide.type === "results") return null;
     if (slide.type === "video") return <div className="slide-guidance"><Video size={18} aria-hidden="true" /> Schau dir das Video gemeinsam mit deiner Klasse an.</div>;
@@ -951,6 +969,7 @@ function InteractionContent(props: {
       )}
       {sentNotice && <div className="success-notice" role="status"><CheckCircle2 size={19} aria-hidden="true" /><span>{sentNotice}</span></div>}
       {unavailable && <p className="field-help">{reviewed ? "Deine Antwort wurde bereits bewertet und kann nicht mehr geändert werden. Sprich mit deiner Lehrkraft, wenn du etwas korrigieren möchtest." : "Du kannst gerade nichts absenden. Warte auf den aktuellen Stundenstand oder bis die Stunde fortgesetzt wird."}</p>}
+      {reviewed && <button className="button button-secondary" type="button" onClick={onRecheckReview} disabled={responseLoading || submitting}>Freigabe prüfen</button>}
       {responseLoading && <p className="field-help" role="status">Deine gespeicherte Antwort wird geladen …</p>}
       <button className="button button-primary submit-button" type="submit" disabled={unavailable || submitting || responseLoading || (isChoice && selected.length === 0 && !photo) || (supportsIdeas && ideas.length === 0 && !photo) || (isOpenResponse && !answer.trim() && !photo)}>
         {submitting ? <><LoaderCircle size={18} className="spin" aria-hidden="true" /> Wird gesendet …</> : <>{reviewed ? "Bereits bewertet" : hasExistingResponse ? "Antwort korrigieren" : "Antwort senden"} <Send size={17} aria-hidden="true" /></>}
