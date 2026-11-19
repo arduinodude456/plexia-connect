@@ -56,11 +56,22 @@ function mapGroupAssignment(row: Record<string, unknown>): SessionGroupAssignmen
     assignedAt: String(row.assigned_at ?? new Date().toISOString()),
   };
 }
-
+function withTimeout<T>(promise: PromiseLike<T>, message: string, milliseconds = 10000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), milliseconds);
+    Promise.resolve(promise).then((value) => { window.clearTimeout(timer); resolve(value); }, (error: unknown) => { window.clearTimeout(timer); reject(error); });
+  });
+}
 export async function signInTeacher(email: string, password: string) {
   const client = requireSupabase();
   const { data, error } = await client.auth.signInWithPassword({ email, password });
   if (error) throw error;
+  const { data: profile, error: profileError } = await client.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle();
+  if (profileError) throw profileError;
+  if (profile?.role !== "teacher") {
+    await client.auth.signOut();
+    throw new Error("Dieses Konto ist als Schülerkonto eingerichtet. Bitte nutze ein Lehrkraftkonto oder erstelle im PLEXIA Studio ein neues Lehrkraftkonto.");
+  }
   return data.user;
 }
 
@@ -79,14 +90,22 @@ export async function signOut() {
 
 export async function getCurrentUser() {
   if (!supabase) return null;
-  const { data, error } = await supabase.auth.getUser();
+  const { data, error } = await withTimeout(supabase.auth.getUser(), "Die Supabase-Verbindung antwortet nicht. Bitte prüfe deine Internetverbindung und lade die Seite erneut.");
   if (error && error.name !== "AuthSessionMissingError") throw error;
+  if (data.user) {
+    const { data: profile, error: profileError } = await withTimeout(supabase.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle(), "Das Lehrkraftprofil konnte nicht geladen werden. Bitte lade die Seite erneut.");
+    if (profileError) throw profileError;
+    if (profile?.role !== "teacher") {
+      await supabase.auth.signOut();
+      throw new Error("Dieses Konto ist als Schülerkonto eingerichtet. Bitte nutze ein Lehrkraftkonto oder erstelle im PLEXIA Studio ein neues Lehrkraftkonto.");
+    }
+  }
   return data.user;
 }
 
 export async function listPresentations(): Promise<Presentation[]> {
   const client = requireSupabase();
-  const { data, error } = await client.from("presentations").select("data").order("updated_at", { ascending: false });
+  const { data, error } = await withTimeout(client.from("presentations").select("data").order("updated_at", { ascending: false }), "Die Präsentationen konnten nicht geladen werden. Bitte prüfe die Supabase-Verbindung.");
   if (error) throw error;
   return (data ?? []).map((row: { data: Presentation }) => row.data);
 }
@@ -97,15 +116,24 @@ export async function savePresentation(presentation: Presentation): Promise<void
   if (userError) throw userError;
   if (!userResult.user) throw new Error("Bitte melde dich an, um die Präsentation in der Cloud zu speichern.");
   const next = { ...presentation, updatedAt: new Date().toISOString() };
-  const { error } = await client.from("presentations").upsert({
+  const payload = {
     id: next.id,
     owner_id: userResult.user.id,
     title: next.title,
     description: next.description,
     data: next,
     updated_at: next.updatedAt,
-  });
-  if (error) throw error;
+  };
+  const write = () => client.from("presentations").upsert(payload, { onConflict: "id" });
+  let result = await write();
+  if (result.error && ["401", "42501", "PGRST301"].includes(String(result.error.code))) {
+    await client.auth.refreshSession();
+    result = await write();
+  }
+  if (result.error) {
+    const code = result.error.code ? ` [${result.error.code}]` : "";
+    throw new Error(`Cloudspeicherung fehlgeschlagen: ${result.error.message || "Unbekannter Supabase-Fehler"}${code}`);
+  }
 }
 
 export async function uploadPresentationMedia(presentationId: string, file: File): Promise<string> {
@@ -211,7 +239,7 @@ export async function createClassSession(presentation: Presentation): Promise<Cl
     presentation_id: presentation.id,
     status: "live",
     current_slide_index: 0,
-    activity_status: "idle",
+    activity_status: "running",
   }).select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at").single();
   if (error) throw error;
   return mapSession(data as Record<string, unknown>);
