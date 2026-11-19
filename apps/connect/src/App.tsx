@@ -754,7 +754,7 @@ function SlideView({
   };
 
   return (
-    <section className="slide-card" aria-labelledby="slide-title">
+    <section key={slide.id} className="slide-card slide-transition" aria-labelledby="slide-title">
       <div className="slide-card-top"><span className="slide-type"><span className="slide-type-icon">{iconForSlide(slide.type)}</span>{typeLabel[slide.type]}</span><span className="slide-number">FOLIE {session.currentSlideIndex + 1}</span></div>
       <h2 id="slide-title">{slide.title || typeLabel[slide.type]}</h2>
       {prompt && <p className="slide-prompt">{prompt}</p>}
