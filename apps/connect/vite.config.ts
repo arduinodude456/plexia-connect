@@ -11,7 +11,7 @@ export default defineConfig(({ mode }) => {
     root: appRoot,
     base: env.VITE_BASE_PATH || "/",
     plugins: [react(), tsconfigPaths({ projects: [`${appRoot}tsconfig.app.json`] })],
-    server: { host: "0.0.0.0", port: 3001, strictPort: true },
+    server: { host: "0.0.0.0", port: 3001, strictPort: true, allowedHosts: env.PLEXIA_DEV_ALLOWED_HOST ? [env.PLEXIA_DEV_ALLOWED_HOST] : [] },
     preview: { host: "0.0.0.0", port: 3001, strictPort: true },
     build: { outDir: "dist", emptyOutDir: true, sourcemap: false },
   };

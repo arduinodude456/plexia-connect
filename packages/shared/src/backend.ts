@@ -1,14 +1,18 @@
 import { createClient, type RealtimeChannel, type SupabaseClient } from "@supabase/supabase-js";
 import type { ClassSession, Presentation, SessionBundle, SessionGroupAssignment, StudentResponse } from "./model";
 
-const env = import.meta.env;
+const env = import.meta.env ?? {};
 const supabaseUrl = env.VITE_SUPABASE_URL as string | undefined;
 const supabaseAnonKey = env.VITE_SUPABASE_ANON_KEY as string | undefined;
+
+// The old Supabase default key was shared with Studio and does not identify a
+// trustworthy app/role. Do not import or delete it: existing users rejoin once.
+const AUTH_STORAGE_KEY = "plexia-connect-auth-v1";
 
 export const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey);
 export const supabase: SupabaseClient | null = hasSupabaseConfig
   ? createClient(supabaseUrl!, supabaseAnonKey!, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+      auth: { storageKey: AUTH_STORAGE_KEY, persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
       realtime: { params: { eventsPerSecond: 8 } },
     })
   : null;
@@ -47,7 +51,7 @@ function mapResponse(row: Record<string, unknown>): StudentResponse {
   };
 }
 
-const STUDENT_RESPONSE_COLUMNS = "id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at";
+const STUDENT_RESPONSE_COLUMNS = "id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,reviewed";
 
 function mapGroupAssignment(row: Record<string, unknown>): SessionGroupAssignment {
   return {
@@ -64,6 +68,36 @@ function withTimeout<T>(promise: PromiseLike<T>, message: string, milliseconds =
     Promise.resolve(promise).then((value) => { window.clearTimeout(timer); resolve(value); }, (error: unknown) => { window.clearTimeout(timer); reject(error); });
   });
 }
+// Coalesces invalidations and prevents a response started before an event/write
+// from being installed. Polls may request a trailing pass without invalidation.
+export function createSnapshotScheduler(run: (isCurrent: () => boolean) => Promise<void>) {
+  let active = true;
+  let running = false;
+  let pending = false;
+  let generation = 0;
+  const drain = async () => {
+    if (running || !active) return;
+    running = true;
+    try {
+      while (active && pending) {
+        pending = false;
+        const started = generation;
+        try { await run(() => active && started === generation); }
+        catch (error) { console.error("Snapshot-Abgleich fehlgeschlagen", error); }
+      }
+    } finally { running = false; }
+  };
+  return {
+    request(invalidate = true) {
+      if (!active) return;
+      if (invalidate) generation += 1;
+      pending = true;
+      void drain();
+    },
+    close() { active = false; generation += 1; pending = false; },
+  };
+}
+
 export async function signInTeacher(email: string, password: string) {
   const client = requireSupabase();
   const { data, error } = await client.auth.signInWithPassword({ email, password });
@@ -71,7 +105,7 @@ export async function signInTeacher(email: string, password: string) {
   const { data: profile, error: profileError } = await client.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle();
   if (profileError) throw profileError;
   if (profile?.role !== "teacher") {
-    await client.auth.signOut();
+    await client.auth.signOut({ scope: "local" });
     throw new Error("Dieses Konto ist als Schülerkonto eingerichtet. Bitte nutze ein Lehrkraftkonto oder erstelle im PLEXIA Studio ein neues Lehrkraftkonto.");
   }
   return data.user;
@@ -86,7 +120,7 @@ export async function signUpTeacher(email: string, password: string) {
 
 export async function signOut() {
   if (!supabase) return;
-  const { error } = await supabase.auth.signOut();
+  const { error } = await supabase.auth.signOut({ scope: "local" });
   if (error) throw error;
 }
 
@@ -98,7 +132,7 @@ export async function getCurrentUser() {
     const { data: profile, error: profileError } = await withTimeout(supabase.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle(), "Das Lehrkraftprofil konnte nicht geladen werden. Bitte lade die Seite erneut.");
     if (profileError) throw profileError;
     if (profile?.role !== "teacher") {
-      await supabase.auth.signOut();
+      await supabase.auth.signOut({ scope: "local" });
       throw new Error("Dieses Konto ist als Schülerkonto eingerichtet. Bitte nutze ein Lehrkraftkonto oder erstelle im PLEXIA Studio ein neues Lehrkraftkonto.");
     }
   }
@@ -258,30 +292,65 @@ export async function updateClassSession(sessionId: string, patch: Partial<Pick<
   if (error) throw error;
 }
 
-export async function getSessionBundle(sessionId: string): Promise<SessionBundle> {
-  const client = requireSupabase();
-  const { data: sessionRow, error: sessionError } = await client.from("class_sessions")
+export async function getClassSession(sessionId: string, client: SupabaseClient = requireSupabase()): Promise<ClassSession> {
+  const { data, error } = await withTimeout(client.from("class_sessions")
     .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at")
-    .eq("id", sessionId).single();
-  if (sessionError) throw sessionError;
-  const { data: presentationRow, error: presentationError } = await client.from("presentations").select("data")
-    .eq("id", sessionRow.presentation_id).single();
-  if (presentationError) throw presentationError;
-  return { session: mapSession(sessionRow as Record<string, unknown>), presentation: presentationRow.data as Presentation };
+    .eq("id", sessionId).single(), "Der Sitzungsstatus konnte nicht geladen werden.");
+  if (error) throw error;
+  return mapSession(data as Record<string, unknown>);
 }
 
-export async function getSessionSyncSnapshot(sessionId: string, presentationId: string): Promise<{ session: ClassSession; presentationUpdatedAt: string }> {
-  const client = requireSupabase();
-  const { data: sessionRow, error: sessionError } = await client.from("class_sessions")
-    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at")
-    .eq("id", sessionId).single();
-  if (sessionError) throw sessionError;
-  const session = mapSession(sessionRow as Record<string, unknown>);
-  if (session.status === "ended") return { session, presentationUpdatedAt: "" };
-  const { data: presentationRow, error: presentationError } = await client.from("presentations")
-    .select("updated_at").eq("id", presentationId).single();
-  if (presentationError) throw presentationError;
-  return { session, presentationUpdatedAt: String(presentationRow.updated_at ?? "") };
+export async function getSessionBundle(sessionId: string, client: SupabaseClient = requireSupabase()): Promise<SessionBundle> {
+  const session = await getClassSession(sessionId, client);
+  const { data, error } = await withTimeout(client.from("presentations").select("data")
+    .eq("id", session.presentationId).single(), "Die Präsentation konnte nicht geladen werden.");
+  if (error) throw error;
+  return { session, presentation: data.data as Presentation };
+}
+
+// updated_at is a DB revision, not presentation.data.updatedAt (a client clock).
+// Fetch version and data together when needed, so the recorded version matches the data.
+export async function getSessionSyncSnapshot(sessionId: string, presentationId: string, knownVersion = "", client: SupabaseClient = requireSupabase()): Promise<{ session: ClassSession; presentationVersion: string; presentation?: Presentation }> {
+  const session = await getClassSession(sessionId, client);
+  if (session.presentationId !== presentationId) throw new Error("Die Präsentation der Sitzung hat sich geändert.");
+  if (session.status === "ended") return { session, presentationVersion: knownVersion };
+  try {
+    const versionResult = await withTimeout(client.from("presentations").select("updated_at")
+      .eq("id", presentationId).single(), "Die Präsentationsversion konnte nicht geladen werden.");
+    if (versionResult.error) throw versionResult.error;
+    const version = String(versionResult.data.updated_at ?? "");
+    if (version && version === knownVersion) return { session, presentationVersion: version };
+    const full = await withTimeout(client.from("presentations").select("updated_at,data")
+      .eq("id", presentationId).single(), "Die Präsentation konnte nicht geladen werden.");
+    if (full.error) throw full.error;
+    return { session, presentationVersion: String(full.data.updated_at ?? ""), presentation: full.data.data as Presentation };
+  } catch (error) {
+    // A session can end between the two reads; presentation RLS then denies access.
+    const latest = await getClassSession(sessionId, client);
+    if (latest.status === "ended") return { session: latest, presentationVersion: knownVersion };
+    throw error;
+  }
+}
+
+export async function resumeStudentSession(sessionId: string, expectedUserId: string, client: SupabaseClient = requireSupabase()): Promise<{ session: ClassSession; nickname: string; presentation?: Presentation }> {
+  const { data: auth, error: authError } = await withTimeout(client.auth.getSession(), "Die Teilnahmesitzung konnte nicht geprüft werden.");
+  if (authError) throw authError;
+  if (!auth.session?.user.is_anonymous || auth.session.user.id !== expectedUserId) throw new Error("Deine anonyme Teilnahme ist nicht mehr verfügbar. Bitte tritt erneut mit dem Code bei.");
+  const { data: membership, error: memberError } = await withTimeout(client.from("session_participants")
+    .select("nickname").eq("session_id", sessionId).eq("user_id", expectedUserId).maybeSingle(), "Deine Teilnahme konnte nicht geprüft werden.");
+  if (memberError) throw memberError;
+  if (!membership) throw new Error("Deine Teilnahme ist nicht mehr verfügbar. Bitte tritt erneut mit dem Code bei.");
+  const session = await getClassSession(sessionId, client);
+  const nickname = String(membership.nickname);
+  if (session.status === "ended") return { session, nickname };
+  try {
+    const bundle = await getSessionBundle(sessionId, client);
+    return { ...bundle, nickname };
+  } catch (error) {
+    const latest = await getClassSession(sessionId, client);
+    if (latest.status === "ended") return { session: latest, nickname };
+    throw error;
+  }
 }
 
 export async function joinClassSession(joinCode: string, nickname: string): Promise<SessionBundle> {
@@ -290,11 +359,26 @@ export async function joinClassSession(joinCode: string, nickname: string): Prom
   if (sessionError) throw sessionError;
   if (!current.session?.user.is_anonymous) {
     if (current.session) {
-      const { error: signOutError } = await client.auth.signOut();
+      const { error: signOutError } = await client.auth.signOut({ scope: "local" });
       if (signOutError) throw signOutError;
     }
     const { error: signInError } = await client.auth.signInAnonymously({ options: { data: { account_type: "student" } } });
     if (signInError) throw signInError;
+  }
+  // Rejoining under the same anonymous identity must not rename membership:
+  // existing response nicknames are immutable and must match membership for RLS.
+  const activeUser = (await client.auth.getSession()).data.session?.user;
+  if (activeUser) {
+    const prior = await client.from("class_sessions").select("id").eq("join_code", joinCode.trim().toUpperCase()).maybeSingle();
+    if (prior.error) throw prior.error;
+    if (prior.data) {
+      const member = await client.from("session_participants").select("nickname")
+        .eq("session_id", prior.data.id).eq("user_id", activeUser.id).maybeSingle();
+      if (member.error) throw member.error;
+      if (member.data && member.data.nickname !== nickname.trim().slice(0, 24)) {
+        throw new Error(`Du bist in dieser Stunde bereits als „${member.data.nickname}“ beigetreten. Bitte verwende denselben Nickname.`);
+      }
+    }
   }
   const { data, error } = await client.rpc("student_join_classroom", {
     p_join_code: joinCode.trim().toUpperCase(),
@@ -317,9 +401,8 @@ export async function submitResponse(input: {
   answerText?: string;
   answerJson?: Record<string, unknown>;
   mediaPath?: string;
-}): Promise<StudentResponse> {
-  const client = requireSupabase();
-  const { data: userResult, error: userError } = await client.auth.getUser();
+}, client: SupabaseClient = requireSupabase()): Promise<StudentResponse> {
+  const { data: userResult, error: userError } = await withTimeout(client.auth.getUser(), "Die Teilnahmesitzung konnte nicht geprüft werden.");
   if (userError) throw userError;
   if (!userResult.user?.is_anonymous) throw new Error("Schülerantworten müssen aus einer anonymen Teilnahmesitzung gesendet werden.");
   const editable = {
@@ -327,34 +410,36 @@ export async function submitResponse(input: {
     answer_json: input.answerJson ?? {},
     ...(input.mediaPath ? { media_path: input.mediaPath } : {}),
   };
-  const existing = await client.from("student_responses").select("id")
+  const existing = await withTimeout(client.from("student_responses").select("id")
     .eq("session_id", input.sessionId).eq("slide_id", input.slideId)
-    .eq("participant_id", userResult.user.id).maybeSingle();
+    .eq("participant_id", userResult.user.id).maybeSingle(), "Deine Antwort konnte nicht geprüft werden. Bitte versuche es erneut.");
   if (existing.error) throw existing.error;
   if (existing.data) {
-    const { data, error } = await client.from("student_responses").update(editable)
-      .eq("id", existing.data.id).eq("participant_id", userResult.user.id)
-      .select(STUDENT_RESPONSE_COLUMNS).single();
+    const { data, error } = await withTimeout(client.from("student_responses").update(editable)
+      .eq("id", existing.data.id).eq("participant_id", userResult.user.id).eq("reviewed", false)
+      .select(STUDENT_RESPONSE_COLUMNS).maybeSingle(), "Das Senden wurde nicht bestätigt. Prüfe die Verbindung und versuche es erneut.");
     if (error) throw error;
+    if (!data) throw new Error("Die Antwort kann nicht mehr geändert werden. Sie wurde möglicherweise bewertet oder die Stunde hat sich geändert.");
     return mapResponse(data as Record<string, unknown>);
   }
-  const { data, error } = await client.from("student_responses").insert({
+  const { data, error } = await withTimeout(client.from("student_responses").insert({
     session_id: input.sessionId,
     slide_id: input.slideId,
     participant_id: userResult.user.id,
     nickname: input.nickname.trim().slice(0, 24),
     ...editable,
-  }).select(STUDENT_RESPONSE_COLUMNS).single();
+  }).select(STUDENT_RESPONSE_COLUMNS).single(), "Das Senden wurde nicht bestätigt. Prüfe die Verbindung und versuche es erneut.");
   if (error?.code === "23505") {
-    const raced = await client.from("student_responses").select("id")
+    const raced = await withTimeout(client.from("student_responses").select("id")
       .eq("session_id", input.sessionId).eq("slide_id", input.slideId)
-      .eq("participant_id", userResult.user.id).maybeSingle();
+      .eq("participant_id", userResult.user.id).maybeSingle(), "Deine Antwort konnte nicht geprüft werden.");
     if (raced.error) throw raced.error;
     if (raced.data) {
-      const corrected = await client.from("student_responses").update(editable)
-        .eq("id", raced.data.id).eq("participant_id", userResult.user.id)
-        .select(STUDENT_RESPONSE_COLUMNS).single();
+      const corrected = await withTimeout(client.from("student_responses").update(editable)
+        .eq("id", raced.data.id).eq("participant_id", userResult.user.id).eq("reviewed", false)
+        .select(STUDENT_RESPONSE_COLUMNS).maybeSingle(), "Das Senden wurde nicht bestätigt. Prüfe die Verbindung und versuche es erneut.");
       if (corrected.error) throw corrected.error;
+      if (!corrected.data) throw new Error("Die Antwort kann nicht mehr geändert werden. Sie wurde möglicherweise bewertet oder die Stunde hat sich geändert.");
       return mapResponse(corrected.data as Record<string, unknown>);
     }
   }
@@ -364,13 +449,13 @@ export async function submitResponse(input: {
 
 export async function getStudentResponse(sessionId: string, slideId: string): Promise<StudentResponse | null> {
   const client = requireSupabase();
-  const { data: userResult, error: userError } = await client.auth.getUser();
+  const { data: userResult, error: userError } = await withTimeout(client.auth.getUser(), "Die Teilnahmesitzung konnte nicht geprüft werden.");
   if (userError) throw userError;
   if (!userResult.user?.is_anonymous) return null;
-  const { data, error } = await client.from("student_responses")
+  const { data, error } = await withTimeout(client.from("student_responses")
     .select(STUDENT_RESPONSE_COLUMNS)
     .eq("session_id", sessionId).eq("slide_id", slideId)
-    .eq("participant_id", userResult.user.id).maybeSingle();
+    .eq("participant_id", userResult.user.id).maybeSingle(), "Deine gespeicherte Antwort konnte nicht geladen werden.");
   if (error) throw error;
   return data ? mapResponse(data as Record<string, unknown>) : null;
 }
@@ -379,12 +464,12 @@ export async function uploadStudentPhoto(sessionId: string, file: File): Promise
   const client = requireSupabase();
   if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) throw new Error("Dieses Bildformat wird nicht unterstützt. Bitte wähle PNG, JPEG oder WebP; HEIC kann hier nicht hochgeladen werden.");
   if (file.size > 12 * 1024 * 1024) throw new Error("Das Foto darf höchstens 12 MB groß sein.");
-  const { data: userResult, error: userError } = await client.auth.getUser();
+  const { data: userResult, error: userError } = await withTimeout(client.auth.getUser(), "Die Teilnahmesitzung konnte nicht geprüft werden.");
   if (userError) throw userError;
   if (!userResult.user) throw new Error("Teilnahmesitzung abgelaufen. Bitte tritt erneut bei.");
   const extension = file.name.split(".").pop()?.replace(/[^a-z0-9]/gi, "").toLowerCase() || "jpg";
   const path = `${sessionId}/${userResult.user.id}/${crypto.randomUUID()}.${extension}`;
-  const { error } = await client.storage.from("student-uploads").upload(path, file, { cacheControl: "3600", upsert: false, contentType: file.type });
+  const { error } = await withTimeout(client.storage.from("student-uploads").upload(path, file, { cacheControl: "3600", upsert: false, contentType: file.type }), "Der Fotoupload wurde nicht bestätigt. Prüfe die Verbindung und versuche es erneut.", 30000);
   if (error) throw error;
   return path;
 }
@@ -435,13 +520,13 @@ export async function saveGroupAssignments(sessionId: string, slideId: string, a
 
 export async function getMyGroupAssignment(sessionId: string, slideId: string): Promise<SessionGroupAssignment | null> {
   const client = requireSupabase();
-  const { data: userData, error: userError } = await client.auth.getUser();
+  const { data: userData, error: userError } = await withTimeout(client.auth.getUser(), "Die Teilnahmesitzung konnte nicht geprüft werden.");
   if (userError) throw userError;
   if (!userData.user) return null;
-  const { data, error } = await client.from("session_group_assignments")
+  const { data, error } = await withTimeout(client.from("session_group_assignments")
     .select("session_id,slide_id,user_id,group_number,assigned_at")
     .eq("session_id", sessionId).eq("slide_id", slideId).eq("user_id", userData.user.id)
-    .maybeSingle();
+    .maybeSingle(), "Die Gruppenzuteilung konnte nicht geladen werden.");
   if (error) throw error;
   return data ? mapGroupAssignment(data as Record<string, unknown>) : null;
 }
@@ -475,21 +560,18 @@ export function subscribeToStudentSession(
     .on("postgres_changes", { event: "UPDATE", schema: "public", table: "class_sessions", filter: `id=eq.${sessionId}` },
       (payload: { new: Record<string, unknown> }) => onSession(mapSession(payload.new)))
     .subscribe((status) => {
-      if (status === "SUBSCRIBED") onStatus("");
-      else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-        onStatus("Die Live-Verbindung wurde unterbrochen. Connect versucht automatisch, sie wiederherzustellen.");
-      }
+      onStatus(status);
     });
 }
 
-export function subscribeToPresentation(presentationId: string, onPresentation: (presentation: Presentation) => void): RealtimeChannel {
+export function subscribeToPresentation(presentationId: string, onPresentation: (presentation: Presentation) => void, onStatus?: (status: string) => void): RealtimeChannel {
   const client = requireSupabase();
   return client.channel(`plexia-presentation-${presentationId}`)
     .on("postgres_changes", { event: "UPDATE", schema: "public", table: "presentations", filter: `id=eq.${presentationId}` },
       (payload: { new: Record<string, unknown> }) => {
         if (payload.new?.data && typeof payload.new.data === "object") onPresentation(payload.new.data as Presentation);
       })
-    .subscribe();
+    .subscribe((status) => onStatus?.(status));
 }
 
 export async function updateTeacherReview(responseId: string, score: number, feedback: string, aiEvaluation?: Record<string, unknown>): Promise<void> {
