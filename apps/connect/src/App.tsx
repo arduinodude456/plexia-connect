@@ -935,10 +935,11 @@ function InteractionContent(props: {
       {isChoice && (
         <fieldset className="choice-fieldset" disabled={unavailable || submitting || responseLoading}>
           <legend>{multiple ? "Wähle eine oder mehrere Antworten:" : "Wähle eine Antwort:"}</legend>
-          <div className="choice-list">
+          <div className={`choice-list ${slide.type === "multiple_choice" ? "kahoot-choice-list" : ""}`}>
             {options.map((option, index) => (
-              <label className={`choice-option${selected.includes(option) ? " selected" : ""}`} key={`${option}-${index}`}>
+              <label className={`choice-option kahoot-choice-option${selected.includes(option) ? " selected" : ""}`} key={`${option}-${index}`}>
                 <input type={multiple ? "checkbox" : "radio"} name={`slide-answer-${slide.id}`} checked={selected.includes(option)} onChange={() => toggleOption(option, multiple)} />
+                <span className="choice-kahoot-glyph" aria-hidden="true">{String.fromCharCode(65 + index)}</span>
                 <span className={multiple ? "custom-check" : "custom-radio"} aria-hidden="true">{multiple && selected.includes(option) && <Check size={13} />}</span>
                 <span>{option}</span>
               </label>
