@@ -495,6 +495,9 @@ function SessionView({
   // Do not substitute the last slide for an out-of-date/invalid server index.
   const index = session.currentSlideIndex;
   const slide = presentation.slides[index];
+  const previousSlideIndex = useRef(index);
+  const slideDirection = index < previousSlideIndex.current ? "back" : "forward";
+  useEffect(() => { previousSlideIndex.current = index; }, [index]);
   const status = displayStatus(session);
   const unavailable = sessionIsUnavailable(session);
   return (
@@ -514,7 +517,7 @@ function SessionView({
       {sessionError && <div className="inline-error" role="alert">{sessionError}</div>}
       {unavailable && <PausedNotice status={status} activityStatus={session.activityStatus} onLeave={leaveWithWarning} />}
       {slide ? (
-        <div hidden={unavailable}><SlideView
+        <div hidden={unavailable} className={`session-slide-transition ${slideDirection}`}><SlideView
           key={`${session.id}-${slide.id}`}
           slide={slide}
           session={session}
