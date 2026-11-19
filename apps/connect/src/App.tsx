@@ -23,7 +23,9 @@ import {
   hasSupabaseConfig,
   createSignedPresentationUrl,
   getStudentResponse,
+  getSessionSyncSnapshot,
   getMyGroupAssignment,
+  getSessionBundle,
   joinClassSession,
   subscribeToPresentation,
   subscribeToStudentSession,
@@ -68,6 +70,10 @@ const demoPresentation: Presentation = {
 function errorMessage(error: unknown): string {
   if (error instanceof Error) {
     const message = error.message;
+    const code = typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code ?? "") : "";
+    if (code === "anonymous_provider_disabled" || /anonymous.*(?:disabled|not enabled)|(?:disabled|not enabled).*anonymous/i.test(message)) {
+      return "Die anonyme Schüleranmeldung ist noch nicht freigeschaltet. Bitte wende dich an deine Lehrkraft.";
+    }
     if (/not found|nicht gefunden|ended|beendet/i.test(message)) {
       return "Dieser Zugangscode ist ungültig oder die Stunde ist nicht mehr verfügbar. Bitte prüfe den Code bei deiner Lehrkraft.";
     }
@@ -126,27 +132,83 @@ function App() {
     let active = true;
     let channel: ReturnType<typeof subscribeToStudentSession> | null = null;
     let presentationChannel: ReturnType<typeof subscribeToPresentation> | null = null;
+    let syncGeneration = 0;
+    let syncInFlight = false;
+    let failedSyncs = 0;
+    let realtimeMessage = "";
+    let knownPresentationUpdatedAt = bundle.presentation.updatedAt;
+    const refreshSnapshot = async () => {
+      if (!active || syncInFlight) return;
+      syncInFlight = true;
+      const generation = ++syncGeneration;
+      try {
+        const snapshot = await getSessionSyncSnapshot(bundle.session.id, bundle.session.presentationId);
+        if (!active || generation !== syncGeneration) return;
+        let nextSession = snapshot.session;
+        let nextPresentation: Presentation | null = null;
+        if (snapshot.presentationUpdatedAt && snapshot.presentationUpdatedAt !== knownPresentationUpdatedAt) {
+          const latest = await getSessionBundle(bundle.session.id);
+          if (!active || generation !== syncGeneration) return;
+          nextSession = latest.session;
+          nextPresentation = sanitizeStudentPresentation(latest.presentation);
+          knownPresentationUpdatedAt = snapshot.presentationUpdatedAt;
+        }
+        failedSyncs = 0;
+        setBundle((current) => {
+          if (!current || current.session.id !== nextSession.id) return current;
+          const presentation = nextPresentation ?? current.presentation;
+          const unchanged = current.session.currentSlideIndex === nextSession.currentSlideIndex
+            && current.session.status === nextSession.status
+            && current.session.activityStatus === nextSession.activityStatus
+            && current.presentation.updatedAt === presentation.updatedAt;
+          return unchanged ? current : { ...current, session: nextSession, presentation };
+        });
+        setSessionError(realtimeMessage);
+      } catch {
+        failedSyncs += 1;
+        if (active && failedSyncs >= 2) {
+          setSessionError(realtimeMessage || "Die Verbindung ist kurz unterbrochen. Connect gleicht die Stunde automatisch erneut ab.");
+        }
+      } finally {
+        syncInFlight = false;
+      }
+    };
     try {
       channel = subscribeToStudentSession(
         bundle.session.id,
         (session) => {
           if (!active) return;
+          syncGeneration += 1;
+          realtimeMessage = "";
           setBundle((current) => current ? { ...current, session } : current);
           setSessionError("");
         },
         (message) => {
+          realtimeMessage = message;
           if (active) setSessionError(message);
         },
       );
       presentationChannel = subscribeToPresentation(bundle.session.presentationId, (presentation) => {
         if (!active) return;
+        syncGeneration += 1;
+        knownPresentationUpdatedAt = presentation.updatedAt;
         setBundle((current) => current ? { ...current, presentation: sanitizeStudentPresentation(presentation) } : current);
       });
     } catch (error) {
-      setSessionError(`Live-Aktualisierung nicht verfügbar: ${errorMessage(error)}`);
+      realtimeMessage = `Live-Aktualisierung nicht verfügbar: ${errorMessage(error)}`;
+      setSessionError(realtimeMessage);
     }
+    const syncTimer = window.setInterval(() => void refreshSnapshot(), 6000);
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") void refreshSnapshot();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    void refreshSnapshot();
     return () => {
       active = false;
+      syncGeneration += 1;
+      window.clearInterval(syncTimer);
+      document.removeEventListener("visibilitychange", handleVisibility);
       if (channel && supabase) void supabase.removeChannel(channel);
       if (presentationChannel && supabase) void supabase.removeChannel(presentationChannel);
     };

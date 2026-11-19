@@ -270,6 +270,20 @@ export async function getSessionBundle(sessionId: string): Promise<SessionBundle
   return { session: mapSession(sessionRow as Record<string, unknown>), presentation: presentationRow.data as Presentation };
 }
 
+export async function getSessionSyncSnapshot(sessionId: string, presentationId: string): Promise<{ session: ClassSession; presentationUpdatedAt: string }> {
+  const client = requireSupabase();
+  const { data: sessionRow, error: sessionError } = await client.from("class_sessions")
+    .select("id,presentation_id,join_code,status,current_slide_index,activity_status,created_at")
+    .eq("id", sessionId).single();
+  if (sessionError) throw sessionError;
+  const session = mapSession(sessionRow as Record<string, unknown>);
+  if (session.status === "ended") return { session, presentationUpdatedAt: "" };
+  const { data: presentationRow, error: presentationError } = await client.from("presentations")
+    .select("updated_at").eq("id", presentationId).single();
+  if (presentationError) throw presentationError;
+  return { session, presentationUpdatedAt: String(presentationRow.updated_at ?? "") };
+}
+
 export async function joinClassSession(joinCode: string, nickname: string): Promise<SessionBundle> {
   const client = requireSupabase();
   const { data: current, error: sessionError } = await client.auth.getSession();
