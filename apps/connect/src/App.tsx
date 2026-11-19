@@ -23,6 +23,7 @@ import {
   hasSupabaseConfig,
   createSignedPresentationUrl,
   getStudentResponse,
+  getMyGroupAssignment,
   joinClassSession,
   subscribeToPresentation,
   subscribeToSession,
@@ -412,6 +413,7 @@ function SlideView({
   const [submitting, setSubmitting] = useState(false);
   const [responseLoading, setResponseLoading] = useState(false);
   const [hasExistingResponse, setHasExistingResponse] = useState(false);
+  const [groupNumber, setGroupNumber] = useState<number | null>(null);
   const [photoError, setPhotoError] = useState("");
   const supportsIdeas = slide.type === "mindmap" || slide.type === "brainstorm" || slide.type === "wordcloud";
   const isChoice = slide.type === "multiple_choice" || slide.type === "poll";
@@ -421,10 +423,21 @@ function SlideView({
 
   useEffect(() => {
     let active = true;
+    let groupTimer: number | undefined;
     setAnswer(""); setSelected([]); setIdeas([]); setIdeaDraft(""); setPhoto(null); setPhotoError("");
     setHasExistingResponse(false);
+    setGroupNumber(null);
     if (!canRespond) return () => { active = false; };
     setResponseLoading(true);
+    if (slide.type === "group_work") {
+      const refreshGroup = () => getMyGroupAssignment(session.id, slide.id).then((assignment) => {
+        if (active) setGroupNumber(assignment?.groupNumber ?? null);
+      }).catch((error) => {
+        if (active) onError(errorMessage(error));
+      });
+      void refreshGroup();
+      groupTimer = window.setInterval(() => void refreshGroup(), 2500);
+    }
     void getStudentResponse(session.id, slide.id).then((response) => {
       if (!active || !response) return;
       setHasExistingResponse(true);
@@ -442,7 +455,7 @@ function SlideView({
     }).finally(() => {
       if (active) setResponseLoading(false);
     });
-    return () => { active = false; };
+    return () => { active = false; if (groupTimer !== undefined) window.clearInterval(groupTimer); };
   }, [session.id, slide.id, canRespond, isChoice, supportsIdeas, onError]);
 
   const addIdea = () => {
@@ -535,6 +548,7 @@ function SlideView({
         hasExistingResponse={hasExistingResponse}
         unavailable={unavailable}
         sentNotice={sentNotice}
+        groupNumber={groupNumber}
         onSubmit={submit}
       />
       {slide.type === "results" && <SharedResultsView value={slide.content.sharedResults} />}
@@ -652,9 +666,10 @@ function InteractionContent(props: {
   hasExistingResponse: boolean;
   unavailable: boolean;
   sentNotice: string;
+  groupNumber: number | null;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const { slide, options, multiple, isChoice, isOpenResponse, supportsIdeas, canRespond, answer, setAnswer, selected, toggleOption, ideas, ideaDraft, setIdeaDraft, addIdea, removeIdea, photo, setPhoto, photoError, setPhotoError, submitting, responseLoading, hasExistingResponse, unavailable, sentNotice, onSubmit } = props;
+  const { slide, options, multiple, isChoice, isOpenResponse, supportsIdeas, canRespond, answer, setAnswer, selected, toggleOption, ideas, ideaDraft, setIdeaDraft, addIdea, removeIdea, photo, setPhoto, photoError, setPhotoError, submitting, responseLoading, hasExistingResponse, unavailable, sentNotice, groupNumber, onSubmit } = props;
   if (!canRespond) {
     if (slide.type === "results") return null;
     if (slide.type === "video") return <div className="slide-guidance"><Video size={18} aria-hidden="true" /> Schau dir das Video gemeinsam mit deiner Klasse an.</div>;
@@ -687,6 +702,7 @@ function InteractionContent(props: {
       )}
       {isOpenResponse && (
         <div className="answer-box">
+          {slide.type === "group_work" && <div className="group-badge" role="status">{groupNumber ? `Du bist in Gruppe ${groupNumber}` : "Deine Lehrkraft teilt dich gleich einer Gruppe zu."}</div>}
           <label className="field-label" htmlFor={`answer-${slide.id}`}>{slide.type === "photo_task" ? "Beschreibe dein Ergebnis (optional)" : slide.type === "worksheet" ? "Deine Lösung" : slide.type === "group_work" ? "Was hat eure Gruppe erarbeitet?" : "Deine Antwort"}</label>
           <textarea id={`answer-${slide.id}`} className="text-input answer-input" maxLength={MAX_ANSWER_LENGTH} value={answer} onChange={(event) => setAnswer(event.target.value)} placeholder={slide.type === "photo_task" ? "Du kannst stattdessen oder zusätzlich ein Foto hinzufügen …" : "Schreib deine Antwort hier …"} disabled={unavailable || submitting} rows={5} />
           <div className="answer-meta"><span>Nur deine Lehrkraft sieht deine Antwort.</span><span>{answer.length}/{MAX_ANSWER_LENGTH}</span></div>
