@@ -593,6 +593,7 @@ function SlideView({
   const previousCompletedWrites = useRef(completedWrites);
   const [responseLoading, setResponseLoading] = useState(true);
   const [hasExistingResponse, setHasExistingResponse] = useState(false);
+  const [reviewed, setReviewed] = useState(false);
   const [groupNumber, setGroupNumber] = useState<number | null>(null);
   const [groupError, setGroupError] = useState("");
   const [photoError, setPhotoError] = useState("");
@@ -600,7 +601,7 @@ function SlideView({
   const isChoice = slide.type === "multiple_choice" || slide.type === "poll";
   const isOpenResponse = slide.type === "free_text" || slide.type === "worksheet" || slide.type === "photo_task" || slide.type === "group_work";
   const canRespond = isChoice || isOpenResponse || supportsIdeas;
-  const unavailable = sessionIsUnavailable(session) || !syncHealthy;
+  const unavailable = sessionIsUnavailable(session) || !syncHealthy || reviewed;
 
   useEffect(() => {
     drafts.current[slide.id] = { answer, selected, ideas, ideaDraft, photo, uploadedPhoto, dirty: dirty.current };
@@ -638,6 +639,7 @@ function SlideView({
     void getStudentResponse(session.id, slide.id).then((response) => {
       if (!active || !response) return;
       setHasExistingResponse(true);
+      setReviewed(Boolean(response.reviewed));
       if (dirty.current) return;
       if (supportsIdeas) {
         const savedIdeas = response.answerJson.ideas;
@@ -765,6 +767,7 @@ function SlideView({
         submitting={submitting}
         responseLoading={responseLoading}
         hasExistingResponse={hasExistingResponse}
+        reviewed={reviewed}
         unavailable={unavailable}
         sentNotice={sentNotice}
         groupNumber={groupNumber}
@@ -893,13 +896,14 @@ function InteractionContent(props: {
   submitting: boolean;
   responseLoading: boolean;
   hasExistingResponse: boolean;
+  reviewed: boolean;
   unavailable: boolean;
   sentNotice: string;
   groupNumber: number | null;
   groupError: string;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const { slide, options, multiple, isChoice, isOpenResponse, supportsIdeas, canRespond, answer, setAnswer, selected, toggleOption, ideas, ideaDraft, setIdeaDraft, addIdea, removeIdea, photo, setPhoto, photoError, setPhotoError, submitting, responseLoading, hasExistingResponse, unavailable, sentNotice, groupNumber, groupError, onSubmit } = props;
+  const { slide, options, multiple, isChoice, isOpenResponse, supportsIdeas, canRespond, answer, setAnswer, selected, toggleOption, ideas, ideaDraft, setIdeaDraft, addIdea, removeIdea, photo, setPhoto, photoError, setPhotoError, submitting, responseLoading, hasExistingResponse, reviewed, unavailable, sentNotice, groupNumber, groupError, onSubmit } = props;
   if (!canRespond) {
     if (slide.type === "results") return null;
     if (slide.type === "video") return <div className="slide-guidance"><Video size={18} aria-hidden="true" /> Schau dir das Video gemeinsam mit deiner Klasse an.</div>;
@@ -946,10 +950,10 @@ function InteractionContent(props: {
         </div>
       )}
       {sentNotice && <div className="success-notice" role="status"><CheckCircle2 size={19} aria-hidden="true" /><span>{sentNotice}</span></div>}
-      {unavailable && <p className="field-help">Du kannst gerade nichts absenden. Warte auf den aktuellen Stundenstand oder bis die Stunde fortgesetzt wird.</p>}
+      {unavailable && <p className="field-help">{reviewed ? "Deine Antwort wurde bereits bewertet und kann nicht mehr geändert werden. Sprich mit deiner Lehrkraft, wenn du etwas korrigieren möchtest." : "Du kannst gerade nichts absenden. Warte auf den aktuellen Stundenstand oder bis die Stunde fortgesetzt wird."}</p>}
       {responseLoading && <p className="field-help" role="status">Deine gespeicherte Antwort wird geladen …</p>}
       <button className="button button-primary submit-button" type="submit" disabled={unavailable || submitting || responseLoading || (isChoice && selected.length === 0 && !photo) || (supportsIdeas && ideas.length === 0 && !photo) || (isOpenResponse && !answer.trim() && !photo)}>
-        {submitting ? <><LoaderCircle size={18} className="spin" aria-hidden="true" /> Wird gesendet …</> : <>{hasExistingResponse ? "Antwort korrigieren" : "Antwort senden"} <Send size={17} aria-hidden="true" /></>}
+        {submitting ? <><LoaderCircle size={18} className="spin" aria-hidden="true" /> Wird gesendet …</> : <>{reviewed ? "Bereits bewertet" : hasExistingResponse ? "Antwort korrigieren" : "Antwort senden"} <Send size={17} aria-hidden="true" /></>}
       </button>
       <p className="response-privacy"><LockKeyhole size={13} aria-hidden="true" /> Deine Antwort wird mit deinem Nickname an die Lehrkraft übermittelt.</p>
     </form>

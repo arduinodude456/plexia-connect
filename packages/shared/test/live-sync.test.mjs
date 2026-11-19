@@ -83,8 +83,8 @@ test('concurrent first submissions use the existing unique row after a 23505 con
         eq(key, value) { calls.push(['eq', key, value]); return this; },
         insert(value) { action = 'insert'; calls.push(['insert', value]); return this; },
         update(value) { action = 'update'; calls.push(['update', value]); return this; },
-        async maybeSingle() { reads++; return ok(reads === 1 ? null : { id: 'r' }); },
-        async single() { return action === 'insert' ? { data: null, error: { code: '23505' } } : ok(saved); },
+        async maybeSingle() { if (action === 'update') return ok(saved); reads++; return ok(reads === 1 ? null : { id: 'r' }); },
+        async single() { assert.equal(action, 'insert'); return { data: null, error: { code: '23505' } }; },
       };
     },
   };
@@ -93,5 +93,37 @@ test('concurrent first submissions use the existing unique row after a 23505 con
   assert.equal(calls.filter(([kind]) => kind === 'update').length, 1);
   const update = calls.find(([kind]) => kind === 'update')[1];
   assert.deepEqual(update, { answer_text: 'answer', answer_json: {} });
+  assert.ok(calls.some(([kind, key, value]) => kind === 'eq' && key === 'reviewed' && value === false));
   assert.ok(calls.filter(([kind]) => kind === 'select').every(([,columns]) => !columns.includes('feedback') && !columns.includes('score')));
 });
+
+for (const race of [false, true]) {
+  for (const matched of [false, true]) {
+    test(`existing response update: ${race ? '23505 race' : 'normal path'}, ${matched ? 'unreviewed row' : 'zero rows'}`, async () => {
+      const filters = []; let reads = 0; let updates = 0;
+      const saved = { id: 'r', session_id: 's', slide_id: 'slide', participant_id: 'u', nickname: 'N', answer_text: 'new', answer_json: {}, created_at: 't' };
+      const client = {
+        auth: { async getUser() { return ok({ user: { id: 'u', is_anonymous: true } }); } },
+        from(table) {
+          assert.equal(table, 'student_responses'); let action = 'read';
+          return {
+            select() { return this; },
+            eq(key, value) { if (action === 'update') filters.push([key, value]); return this; },
+            update() { action = 'update'; updates++; return this; },
+            insert() { action = 'insert'; return this; },
+            async maybeSingle() {
+              if (action === 'update') return ok(matched ? saved : null);
+              reads++; return ok(race && reads === 1 ? null : { id: 'r' });
+            },
+            async single() { assert.equal(action, 'insert'); return { data: null, error: { code: '23505' } }; },
+          };
+        },
+      };
+      const send = submitResponse({ sessionId: 's', slideId: 'slide', nickname: 'N', answerText: 'new' }, client);
+      if (matched) assert.equal((await send).id, 'r');
+      else await assert.rejects(send, { message: 'Die Antwort kann nicht mehr geändert werden. Sie wurde möglicherweise bewertet oder die Stunde hat sich geändert.' });
+      assert.equal(updates, 1);
+      assert.deepEqual(filters, [['id', 'r'], ['participant_id', 'u'], ['reviewed', false]]);
+    });
+  }
+}

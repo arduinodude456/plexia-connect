@@ -5,10 +5,14 @@ const env = import.meta.env ?? {};
 const supabaseUrl = env.VITE_SUPABASE_URL as string | undefined;
 const supabaseAnonKey = env.VITE_SUPABASE_ANON_KEY as string | undefined;
 
+// The old Supabase default key was shared with Studio and does not identify a
+// trustworthy app/role. Do not import or delete it: existing users rejoin once.
+const AUTH_STORAGE_KEY = "plexia-connect-auth-v1";
+
 export const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey);
 export const supabase: SupabaseClient | null = hasSupabaseConfig
   ? createClient(supabaseUrl!, supabaseAnonKey!, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+      auth: { storageKey: AUTH_STORAGE_KEY, persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
       realtime: { params: { eventsPerSecond: 8 } },
     })
   : null;
@@ -47,7 +51,7 @@ function mapResponse(row: Record<string, unknown>): StudentResponse {
   };
 }
 
-const STUDENT_RESPONSE_COLUMNS = "id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at";
+const STUDENT_RESPONSE_COLUMNS = "id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,reviewed";
 
 function mapGroupAssignment(row: Record<string, unknown>): SessionGroupAssignment {
   return {
@@ -101,7 +105,7 @@ export async function signInTeacher(email: string, password: string) {
   const { data: profile, error: profileError } = await client.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle();
   if (profileError) throw profileError;
   if (profile?.role !== "teacher") {
-    await client.auth.signOut();
+    await client.auth.signOut({ scope: "local" });
     throw new Error("Dieses Konto ist als Schülerkonto eingerichtet. Bitte nutze ein Lehrkraftkonto oder erstelle im PLEXIA Studio ein neues Lehrkraftkonto.");
   }
   return data.user;
@@ -116,7 +120,7 @@ export async function signUpTeacher(email: string, password: string) {
 
 export async function signOut() {
   if (!supabase) return;
-  const { error } = await supabase.auth.signOut();
+  const { error } = await supabase.auth.signOut({ scope: "local" });
   if (error) throw error;
 }
 
@@ -128,7 +132,7 @@ export async function getCurrentUser() {
     const { data: profile, error: profileError } = await withTimeout(supabase.from("profiles").select("role").eq("user_id", data.user.id).maybeSingle(), "Das Lehrkraftprofil konnte nicht geladen werden. Bitte lade die Seite erneut.");
     if (profileError) throw profileError;
     if (profile?.role !== "teacher") {
-      await supabase.auth.signOut();
+      await supabase.auth.signOut({ scope: "local" });
       throw new Error("Dieses Konto ist als Schülerkonto eingerichtet. Bitte nutze ein Lehrkraftkonto oder erstelle im PLEXIA Studio ein neues Lehrkraftkonto.");
     }
   }
@@ -355,7 +359,7 @@ export async function joinClassSession(joinCode: string, nickname: string): Prom
   if (sessionError) throw sessionError;
   if (!current.session?.user.is_anonymous) {
     if (current.session) {
-      const { error: signOutError } = await client.auth.signOut();
+      const { error: signOutError } = await client.auth.signOut({ scope: "local" });
       if (signOutError) throw signOutError;
     }
     const { error: signInError } = await client.auth.signInAnonymously({ options: { data: { account_type: "student" } } });
@@ -412,9 +416,10 @@ export async function submitResponse(input: {
   if (existing.error) throw existing.error;
   if (existing.data) {
     const { data, error } = await withTimeout(client.from("student_responses").update(editable)
-      .eq("id", existing.data.id).eq("participant_id", userResult.user.id)
-      .select(STUDENT_RESPONSE_COLUMNS).single(), "Das Senden wurde nicht bestätigt. Prüfe die Verbindung und versuche es erneut.");
+      .eq("id", existing.data.id).eq("participant_id", userResult.user.id).eq("reviewed", false)
+      .select(STUDENT_RESPONSE_COLUMNS).maybeSingle(), "Das Senden wurde nicht bestätigt. Prüfe die Verbindung und versuche es erneut.");
     if (error) throw error;
+    if (!data) throw new Error("Die Antwort kann nicht mehr geändert werden. Sie wurde möglicherweise bewertet oder die Stunde hat sich geändert.");
     return mapResponse(data as Record<string, unknown>);
   }
   const { data, error } = await withTimeout(client.from("student_responses").insert({
@@ -431,9 +436,10 @@ export async function submitResponse(input: {
     if (raced.error) throw raced.error;
     if (raced.data) {
       const corrected = await withTimeout(client.from("student_responses").update(editable)
-        .eq("id", raced.data.id).eq("participant_id", userResult.user.id)
-        .select(STUDENT_RESPONSE_COLUMNS).single(), "Das Senden wurde nicht bestätigt. Prüfe die Verbindung und versuche es erneut.");
+        .eq("id", raced.data.id).eq("participant_id", userResult.user.id).eq("reviewed", false)
+        .select(STUDENT_RESPONSE_COLUMNS).maybeSingle(), "Das Senden wurde nicht bestätigt. Prüfe die Verbindung und versuche es erneut.");
       if (corrected.error) throw corrected.error;
+      if (!corrected.data) throw new Error("Die Antwort kann nicht mehr geändert werden. Sie wurde möglicherweise bewertet oder die Stunde hat sich geändert.");
       return mapResponse(corrected.data as Record<string, unknown>);
     }
   }
