@@ -725,3 +725,15 @@ body { background: #f8f7fc; color: var(--ink); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+
+/* A playful Prezi-like camera move without gradients: zoom out, then settle on the new slide. */
+.slide-transition { transform-origin: 50% 42%; animation: plexia-connect-prezi-in .48s cubic-bezier(.2,.82,.25,1) both; }
+@keyframes plexia-connect-prezi-in {
+  0% { opacity: 0; transform: perspective(1100px) translate3d(0, 24px, -100px) scale(.9) rotateX(2deg); }
+  62% { opacity: 1; transform: perspective(1100px) translate3d(0, -2px, 0) scale(1.012) rotateX(0); }
+  100% { opacity: 1; transform: perspective(1100px) translate3d(0, 0, 0) scale(1) rotateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .slide-transition { animation: none; }
+}
