@@ -47,6 +47,8 @@ function mapResponse(row: Record<string, unknown>): StudentResponse {
   };
 }
 
+const STUDENT_RESPONSE_COLUMNS = "id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at";
+
 function mapGroupAssignment(row: Record<string, unknown>): SessionGroupAssignment {
   return {
     sessionId: String(row.session_id),
@@ -270,13 +272,16 @@ export async function getSessionBundle(sessionId: string): Promise<SessionBundle
 
 export async function joinClassSession(joinCode: string, nickname: string): Promise<SessionBundle> {
   const client = requireSupabase();
-  const { data: current } = await client.auth.getSession();
+  const { data: current, error: sessionError } = await client.auth.getSession();
+  if (sessionError) throw sessionError;
   if (!current.session?.user.is_anonymous) {
-    const { error: signOutError } = await client.auth.signOut();
-    if (signOutError) throw signOutError;
+    if (current.session) {
+      const { error: signOutError } = await client.auth.signOut();
+      if (signOutError) throw signOutError;
+    }
+    const { error: signInError } = await client.auth.signInAnonymously({ options: { data: { account_type: "student" } } });
+    if (signInError) throw signInError;
   }
-  const { error: signInError } = await client.auth.signInAnonymously({ options: { data: { account_type: "student" } } });
-  if (signInError) throw signInError;
   const { data, error } = await client.rpc("student_join_classroom", {
     p_join_code: joinCode.trim().toUpperCase(),
     p_nickname: nickname.trim().slice(0, 24),
@@ -315,7 +320,7 @@ export async function submitResponse(input: {
   if (existing.data) {
     const { data, error } = await client.from("student_responses").update(editable)
       .eq("id", existing.data.id).eq("participant_id", userResult.user.id)
-      .select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed").single();
+      .select(STUDENT_RESPONSE_COLUMNS).single();
     if (error) throw error;
     return mapResponse(data as Record<string, unknown>);
   }
@@ -325,7 +330,7 @@ export async function submitResponse(input: {
     participant_id: userResult.user.id,
     nickname: input.nickname.trim().slice(0, 24),
     ...editable,
-  }).select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed").single();
+  }).select(STUDENT_RESPONSE_COLUMNS).single();
   if (error?.code === "23505") {
     const raced = await client.from("student_responses").select("id")
       .eq("session_id", input.sessionId).eq("slide_id", input.slideId)
@@ -334,7 +339,7 @@ export async function submitResponse(input: {
     if (raced.data) {
       const corrected = await client.from("student_responses").update(editable)
         .eq("id", raced.data.id).eq("participant_id", userResult.user.id)
-        .select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed").single();
+        .select(STUDENT_RESPONSE_COLUMNS).single();
       if (corrected.error) throw corrected.error;
       return mapResponse(corrected.data as Record<string, unknown>);
     }
@@ -349,7 +354,7 @@ export async function getStudentResponse(sessionId: string, slideId: string): Pr
   if (userError) throw userError;
   if (!userResult.user?.is_anonymous) return null;
   const { data, error } = await client.from("student_responses")
-    .select("id,session_id,slide_id,participant_id,nickname,answer_text,answer_json,media_path,created_at,score,feedback,reviewed")
+    .select(STUDENT_RESPONSE_COLUMNS)
     .eq("session_id", sessionId).eq("slide_id", slideId)
     .eq("participant_id", userResult.user.id).maybeSingle();
   if (error) throw error;
@@ -444,6 +449,23 @@ export function subscribeToSession(
     .on("postgres_changes", { event: "UPDATE", schema: "public", table: "student_responses", filter: `session_id=eq.${sessionId}` },
       responseHandler)
     .subscribe();
+}
+
+export function subscribeToStudentSession(
+  sessionId: string,
+  onSession: (session: ClassSession) => void,
+  onStatus: (message: string) => void,
+): RealtimeChannel {
+  const client = requireSupabase();
+  return client.channel(`plexia-student-session-${sessionId}`)
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "class_sessions", filter: `id=eq.${sessionId}` },
+      (payload: { new: Record<string, unknown> }) => onSession(mapSession(payload.new)))
+    .subscribe((status) => {
+      if (status === "SUBSCRIBED") onStatus("");
+      else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        onStatus("Die Live-Verbindung wurde unterbrochen. Connect versucht automatisch, sie wiederherzustellen.");
+      }
+    });
 }
 
 export function subscribeToPresentation(presentationId: string, onPresentation: (presentation: Presentation) => void): RealtimeChannel {

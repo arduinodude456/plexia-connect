@@ -26,7 +26,7 @@ import {
   getMyGroupAssignment,
   joinClassSession,
   subscribeToPresentation,
-  subscribeToSession,
+  subscribeToStudentSession,
   submitResponse,
   supabase,
   uploadStudentPhoto,
@@ -124,18 +124,19 @@ function App() {
   useEffect(() => {
     if (!bundle || !supabase) return;
     let active = true;
-    let channel: ReturnType<typeof subscribeToSession> | null = null;
+    let channel: ReturnType<typeof subscribeToStudentSession> | null = null;
     let presentationChannel: ReturnType<typeof subscribeToPresentation> | null = null;
     try {
-      channel = subscribeToSession(
+      channel = subscribeToStudentSession(
         bundle.session.id,
         (session) => {
           if (!active) return;
           setBundle((current) => current ? { ...current, session } : current);
           setSessionError("");
-          setSentNotice("");
         },
-        () => undefined,
+        (message) => {
+          if (active) setSessionError(message);
+        },
       );
       presentationChannel = subscribeToPresentation(bundle.session.presentationId, (presentation) => {
         if (!active) return;
@@ -150,6 +151,10 @@ function App() {
       if (presentationChannel && supabase) void supabase.removeChannel(presentationChannel);
     };
   }, [bundle?.session.id, bundle?.session.presentationId]);
+
+  useEffect(() => {
+    setSentNotice("");
+  }, [bundle?.session.currentSlideIndex]);
 
   const handleJoin = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -170,7 +175,7 @@ function App() {
     setJoining(true);
     try {
       const joined = await joinClassSession(cleanCode, cleanNickname.slice(0, MAX_NICKNAME_LENGTH));
-      setBundle(joined);
+      setBundle({ ...joined, presentation: sanitizeStudentPresentation(joined.presentation) });
     } catch (error) {
       setJoinError(errorMessage(error));
     } finally {

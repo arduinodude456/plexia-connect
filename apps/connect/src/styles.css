@@ -379,6 +379,10 @@ h1, h2, h3 { font-family: ui-rounded, Inter, ui-sans-serif, system-ui, sans-seri
   .session-title-block p { max-width: 260px; font-size: 12px; line-height: 1.5; }
   .slide-counter { gap: 6px; padding-top: 17px; font-size: 9px; }
   .slide-counter span { font-size: 19px; }
+  .session-overview > *, .session-title-block { min-width: 0; }
+  .session-title-block { flex: 1; }
+  .session-title-block h1, .slide-card > h2, .slide-prompt, .slide-element-text, .choice-option > span:last-child { overflow-wrap: anywhere; }
+  .text-input { font-size: 16px; }
   .slide-card, .pause-card, .empty-slide { padding: 21px 17px; border-radius: 16px; }
   .slide-card > h2 { font-size: 24px; }
   .slide-prompt { font-size: 13px; }
